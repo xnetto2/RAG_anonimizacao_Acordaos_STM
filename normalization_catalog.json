@@ -1,0 +1,28 @@
+{
+  "version": "1.0",
+  "implemented": {
+    "processo_acordao": "PROCESSO:NNNNNNN-NN.AAAA.J.TR.OOOO",
+    "norma": "DIPLOMA:ARTIGO_N[:PARAGRAFO_N][:INCISO_ROMANO][:ALINEA_X]",
+    "sumula": "TRIBUNAL:SUMULA_N"
+  },
+  "diplomas": ["CPM", "CPPM", "CF", "CP", "CPP"],
+  "controlled_relations": [
+    "CITA", "MENCIONA", "APLICA", "AFASTA", "ADOTA_TESE",
+    "DISTINGUE", "DIVERGE_DE", "SUPERA"
+  ],
+  "review_states": [
+    "NAO_REVISADO", "CONFIRMADA", "RECLASSIFICADA", "REJEITADA",
+    "EVIDENCIA_INSUFICIENTE"
+  ],
+  "recommended_next": {
+    "tribunal_orgao": "TRIBUNAL:ORGAO_JULGADOR",
+    "classe_processual": "CLASSE:APELACAO_CRIMINAL",
+    "tema": "TEMA:slug_controlado",
+    "tese": "TESE:hash_da_formulacao_revisada",
+    "ministro": "PESSOA_PUBLICA:nome_normalizado",
+    "data": "AAAA-MM-DD",
+    "secao": "EMENTA|RELATORIO|VOTO|DISPOSITIVO|OUTROS",
+    "papel_argumentativo": "TRIBUNAL|DEFESA|MPM|VOTO_VENCIDO|TRANSCRICAO"
+  }
+}
+

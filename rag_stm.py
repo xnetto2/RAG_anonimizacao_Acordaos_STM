@@ -14,10 +14,10 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
-import fitz
 import joblib
 import networkx as nx
 import numpy as np
+import pymupdf as fitz
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
@@ -25,6 +25,7 @@ from urllib3.util.retry import Retry
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import Normalizer
+from normalization import canonical_entity
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -87,6 +88,16 @@ def db_conn() -> sqlite3.Connection:
           anonymized_sha256 TEXT, report_path TEXT, status TEXT NOT NULL,
           processed_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS anonymization_review_events(
+          id INTEGER PRIMARY KEY,
+          document_id INTEGER NOT NULL REFERENCES documents(id),
+          previous_status TEXT NOT NULL,
+          decision TEXT NOT NULL,
+          reviewer TEXT NOT NULL,
+          notes TEXT,
+          anonymized_sha256 TEXT NOT NULL,
+          reviewed_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS chunks(
           id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL REFERENCES documents(id),
           chunk_key TEXT UNIQUE NOT NULL, section TEXT NOT NULL, ordinal INTEGER NOT NULL,
@@ -113,6 +124,16 @@ def db_conn() -> sqlite3.Connection:
           evidence TEXT NOT NULL, method TEXT NOT NULL, confidence REAL NOT NULL,
           review_status TEXT NOT NULL DEFAULT 'NAO_REVISADO',
           UNIQUE(document_id,chunk_id,source_entity_id,relation,target_entity_id)
+        );
+        CREATE TABLE IF NOT EXISTS relation_review_events(
+          id INTEGER PRIMARY KEY,
+          relation_id INTEGER NOT NULL,
+          previous_relation TEXT NOT NULL,
+          reviewed_relation TEXT NOT NULL,
+          decision TEXT NOT NULL,
+          reviewer TEXT NOT NULL,
+          notes TEXT,
+          reviewed_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS index_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """
@@ -304,25 +325,62 @@ def make_chunks(pages: list[tuple[int, str, str]]) -> list[dict]:
 
 def chunk_documents() -> None:
     con = db_conn()
+    # Incorpora cópias anonimizadas cujo download foi concluído antes de uma
+    # interrupção, mas cujo registro não chegou a ser persistido no banco.
+    anon_dir = DATA / "anonymized" / "pdfs"
+    known = {Path(r[0]).name for r in con.execute("SELECT pdf_path FROM documents")}
+    for anon_path in sorted(anon_dir.glob("*.pdf")):
+        if anon_path.name in known:
+            continue
+        raw_path = PDFS / anon_path.name
+        raw_bytes = raw_path.read_bytes() if raw_path.exists() else anon_path.read_bytes()
+        digest = sha256_bytes(raw_bytes)
+        cur = con.execute("""INSERT INTO documents(uuid,process_number,pdf_path,pdf_sha256,
+            extraction_status,collected_at,metadata_json) VALUES(?,?,?,?,?,?,?)""",
+            (f"orphan:{digest}", anon_path.stem, str((raw_path if raw_path.exists() else anon_path).relative_to(ROOT)),
+             digest, "ORFAO_SEM_METADADOS", datetime.now().isoformat(),
+             json.dumps({"status": "ORFAO_SEM_METADADOS", "filename": anon_path.name}, ensure_ascii=False)))
+        con.execute("""INSERT INTO anonymized_documents(document_id,source_sha256,anonymized_pdf_path,
+            anonymized_sha256,status,processed_at) VALUES(?,?,?,?,?,?)""",
+            (cur.lastrowid, digest, str(anon_path.relative_to(ROOT)), sha256_bytes(anon_path.read_bytes()),
+             "ORFAO_SEM_METADADOS", datetime.now().isoformat()))
+        print(f"aviso: registrado sem metadados oficiais: {anon_path.name}")
+    con.commit()
     docs = con.execute("SELECT * FROM documents ORDER BY id").fetchall()
+    # Chunks, FTS e relações são artefatos derivados e são reconstruídos juntos
+    # para impedir mistura entre versões originais e anonimizadas.
+    con.execute("DELETE FROM relations")
+    con.execute("DELETE FROM chunks")
+    con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+    con.commit()
     total = 0
     for d in docs:
-        anon = con.execute("SELECT * FROM anonymized_documents WHERE document_id=? AND status='OK'", (d["id"],)).fetchone()
-        path = ROOT / (anon["anonymized_pdf_path"] if anon else d["pdf_path"])
+        anon = con.execute("SELECT * FROM anonymized_documents WHERE document_id=? AND anonymized_pdf_path IS NOT NULL", (d["id"],)).fetchone()
+        if not anon:
+            con.execute("UPDATE documents SET extraction_status=? WHERE id=?", ("SEM_PDF_ANONIMIZADO", d["id"]))
+            con.commit()
+            continue
+        path = ROOT / anon["anonymized_pdf_path"]
+        if not path.exists():
+            con.execute("UPDATE documents SET extraction_status=? WHERE id=?", ("PDF_ANONIMIZADO_AUSENTE", d["id"]))
+            con.commit()
+            continue
         try:
             pdf = fitz.open(path)
             chunks = make_chunks(page_sections(pdf))
-            con.execute("DELETE FROM chunks WHERE document_id=?", (d["id"],))
             for c in chunks:
                 h = sha256_bytes(c["text"].encode("utf-8"))
                 key = f"{d['uuid']}:{c['ordinal']:04d}:{h[:12]}"
                 con.execute("INSERT INTO chunks(document_id,chunk_key,section,ordinal,page_start,page_end,token_count,text,text_sha256) VALUES(?,?,?,?,?,?,?,?,?)",
                     (d["id"], key, c["section"], c["ordinal"], c["page_start"], c["page_end"], c["token_count"], c["text"], h))
-            con.execute("UPDATE documents SET page_count=?, extraction_status=? WHERE id=?", (len(pdf), "OK" if chunks else "SEM_TEXTO", d["id"]))
+            status = f"OK_ANONIMIZADO:{anon['status']}" if chunks else "SEM_TEXTO_ANONIMIZADO"
+            con.execute("UPDATE documents SET page_count=?, extraction_status=? WHERE id=?", (len(pdf), status, d["id"]))
             total += len(chunks)
         except Exception as exc:
             con.execute("UPDATE documents SET extraction_status=? WHERE id=?", (f"ERRO:{type(exc).__name__}", d["id"]))
         con.commit()
+    con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+    con.commit()
     print(f"segmentação concluída: {len(docs)} documentos, {total} chunks")
 
 
@@ -333,14 +391,22 @@ ENTITY_PATTERNS = {
 }
 
 
-def entity(con: sqlite3.Connection, kind: str, label: str) -> int:
-    canonical = norm(label)
+def entity(con: sqlite3.Connection, kind: str, label: str, context: str = "") -> int:
+    canonical = canonical_entity(kind, label, context)
     con.execute("INSERT OR IGNORE INTO entities(kind,canonical,label) VALUES(?,?,?)", (kind, canonical, label))
     return con.execute("SELECT id FROM entities WHERE kind=? AND canonical=?", (kind, canonical)).fetchone()[0]
 
 
 def build_graph() -> None:
     con = db_conn()
+    reviewed = {
+        (r["document_id"], r["chunk_key"], r["target_kind"], r["target_canonical"]):
+        (r["relation"], r["review_status"])
+        for r in con.execute("""SELECT r.document_id,c.chunk_key,e.kind target_kind,
+          e.canonical target_canonical,r.relation,r.review_status FROM relations r
+          JOIN chunks c ON c.id=r.chunk_id JOIN entities e ON e.id=r.target_entity_id
+          WHERE r.review_status IN ('CONFIRMADA','RECLASSIFICADA','REJEITADA','EVIDENCIA_INSUFICIENTE')""")
+    }
     con.execute("DELETE FROM relations")
     con.execute("DELETE FROM entities")
     docs = con.execute("SELECT * FROM documents ORDER BY id").fetchall()
@@ -352,12 +418,17 @@ def build_graph() -> None:
                     label = m.group(0)
                     if kind == "PROCESSO" and label == d["process_number"]:
                         continue
-                    target = entity(con, kind, label)
+                    context = c["text"][max(0, m.start()-160):min(len(c["text"]), m.end()+160)]
+                    target = entity(con, kind, label, context)
                     relation = {"PROCESSO": "CITA", "NORMA": "APLICA_OU_MENCIONA", "SUMULA": "CITA"}[kind]
                     a, b = max(0, m.start()-120), min(len(c["text"]), m.end()+180)
                     evidence = c["text"][a:b]
                     con.execute("INSERT OR IGNORE INTO relations(document_id,chunk_id,source_entity_id,relation,target_entity_id,evidence,method,confidence) VALUES(?,?,?,?,?,?,?,?)",
                         (d["id"], c["id"], source, relation, target, evidence, "REGEX", 0.95))
+                    prior = reviewed.get((d["id"], c["chunk_key"], kind, canonical_entity(kind, label, context)))
+                    if prior:
+                        con.execute("UPDATE relations SET relation=?,review_status=? WHERE document_id=? AND chunk_id=? AND target_entity_id=?",
+                                    (prior[0], prior[1], d["id"], c["id"], target))
     con.commit()
     g = nx.MultiDiGraph()
     for e in con.execute("SELECT * FROM entities"):
@@ -439,16 +510,92 @@ def rrf(*rankings: list[tuple[int, float]], k: int = 60) -> list[tuple[int, floa
     return sorted(scores.items(), key=lambda x: -x[1])
 
 
-def search(query: str, mode: str, k: int) -> None:
+REVIEW_WEIGHTS = {
+    "CONFIRMADA": 1.0,
+    "RECLASSIFICADA": 1.0,
+    "NAO_REVISADO": 0.25,
+    "EVIDENCIA_INSUFICIENTE": 0.0,
+    "REJEITADA": 0.0,
+}
+
+
+def graph_search(con: sqlite3.Connection, seeds: list[tuple[int, float]], k: int) -> list[tuple[int, float]]:
+    """Expande um salto por entidades compartilhadas; revisão humana controla o peso."""
+    scores: dict[int, float] = {}
+    for seed_rank, (seed_chunk, _) in enumerate(seeds, 1):
+        seed_factor = 1.0 / seed_rank
+        seed_relations = con.execute("SELECT target_entity_id,review_status FROM relations WHERE chunk_id=?", (seed_chunk,)).fetchall()
+        for seed_rel in seed_relations:
+            seed_weight = REVIEW_WEIGHTS.get(seed_rel["review_status"], 0.0)
+            if seed_weight <= 0:
+                continue
+            connected = con.execute("""SELECT chunk_id,review_status FROM relations
+                WHERE target_entity_id=? AND chunk_id IS NOT NULL AND chunk_id<>?""",
+                (seed_rel["target_entity_id"], seed_chunk)).fetchall()
+            for candidate in connected:
+                candidate_weight = REVIEW_WEIGHTS.get(candidate["review_status"], 0.0)
+                if candidate_weight <= 0:
+                    continue
+                path_score = seed_factor * seed_weight * candidate_weight
+                # O melhor caminho prevalece. Somar muitos vínculos automáticos
+                # não pode artificialmente alcançar o peso de uma relação revisada.
+                scores[candidate["chunk_id"]] = max(scores.get(candidate["chunk_id"], 0.0), path_score)
+    return sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:k]
+
+
+def rrf_with_weighted_graph(lexical, vector, graph, k: int = 60):
+    scores: dict[int, float] = {}
+    for ranking in (lexical, vector):
+        for rank, (chunk_id, _) in enumerate(ranking, 1):
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
+    for rank, (chunk_id, graph_weight) in enumerate(graph, 1):
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + min(1.0, max(0.0, graph_weight)) / (k + rank)
+    return sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+
+
+def search_results(query: str, mode: str = "hybrid", k: int = 5) -> list[dict]:
+    """Executa a recuperação e devolve resultados estruturados para CLI/UI."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    if mode not in {"lexical", "vector", "hybrid"}:
+        raise ValueError(f"Modo de busca inválido: {mode}")
+    if k < 1:
+        raise ValueError("A quantidade de resultados deve ser positiva")
     con = db_conn()
-    lex = lexical_search(con, query, max(k*4, 20))
-    vec = vector_search(query, max(k*4, 20)) if mode in {"vector", "hybrid"} else []
-    ranked = lex if mode == "lexical" else vec if mode == "vector" else rrf(lex, vec)
+    pool = max(k * 4, 20)
+    lex = lexical_search(con, query, pool)
+    vec = vector_search(query, pool) if mode in {"vector", "hybrid"} else []
+    graph = graph_search(con, rrf(lex, vec)[:max(k*2, 10)], max(k*4, 20)) if mode == "hybrid" else []
+    ranked = lex if mode == "lexical" else vec if mode == "vector" else rrf_with_weighted_graph(lex, vec, graph)
+    diagnostics = {
+        "lexical": {cid: (rank, score) for rank, (cid, score) in enumerate(lex, 1)},
+        "vector": {cid: (rank, score) for rank, (cid, score) in enumerate(vec, 1)},
+        "graph": {cid: (rank, score) for rank, (cid, score) in enumerate(graph, 1)},
+    }
+    results = []
     for rank, (cid, score) in enumerate(ranked[:k], 1):
         r = con.execute("""SELECT c.*,d.process_number,d.official_pdf_url,d.judgment_date,d.publication_date
           FROM chunks c JOIN documents d ON d.id=c.document_id WHERE c.id=?""", (cid,)).fetchone()
+        entities = [dict(item) for item in con.execute("""SELECT e.kind,e.canonical,e.label,
+          rel.relation,rel.review_status FROM relations rel
+          JOIN entities e ON e.id=rel.target_entity_id WHERE rel.chunk_id=?
+          ORDER BY e.kind,e.canonical""", (cid,))]
+        item = dict(r)
+        item.update(rank=rank, score=float(score), entities=entities)
+        for source in ("lexical", "vector", "graph"):
+            source_data = diagnostics[source].get(cid)
+            item[f"{source}_rank"] = source_data[0] if source_data else None
+            item[f"{source}_score"] = float(source_data[1]) if source_data else None
+        results.append(item)
+    con.close()
+    return results
+
+
+def search(query: str, mode: str, k: int) -> None:
+    for r in search_results(query, mode, k):
         excerpt = r["text"][:700].replace("\n", " ")
-        print(f"\n[{rank}] score={score:.5f} | {r['process_number']} | {r['section']} | pp. {r['page_start']}-{r['page_end']}")
+        print(f"\n[{r['rank']}] score={r['score']:.5f} | {r['process_number']} | {r['section']} | pp. {r['page_start']}-{r['page_end']}")
         print(excerpt + ("…" if len(r["text"]) > 700 else ""))
         print(r["official_pdf_url"])
 

@@ -14,6 +14,8 @@ python rag_stm.py chunk
 python rag_stm.py pipeline
 python rag_stm.py search "Quais provas são exigidas para o estado de necessidade exculpante?" --mode hybrid
 python rag_stm.py stats
+streamlit run review_app.py
+streamlit run search_app.py
 ```
 
 O pipeline é incremental: PDFs existentes e registros com o mesmo UUID não são
@@ -52,9 +54,22 @@ da consulta ao inteiro teor.
   contrário, LSA local explicitamente identificado no resultado;
 - `hybrid`: fusão por Reciprocal Rank Fusion e expansão por entidades do grafo.
 
+Na expansão do grafo, relações `CONFIRMADA` e `RECLASSIFICADA` recebem peso
+integral (1,0), `NAO_REVISADO` recebe peso exploratório reduzido (0,25), e
+`REJEITADA`/`EVIDENCIA_INSUFICIENTE` não influenciam o ranking. A interface
+`review_app.py` registra toda decisão em histórico sem apagar o valor anterior.
+
+O catálogo de formas canônicas está em `normalization_catalog.json`. Exemplos:
+`CPM:ARTIGO_39`, `CPPM:ARTIGO_457:PARAGRAFO_4`,
+`PROCESSO:7000000-00.2023.7.00.0000` e `STM:SUMULA_3`.
+
 O comando retorna sempre processo, seção, páginas, URL oficial e excerto. A
 geração textual por LLM foi deixada desacoplada: primeiro se valida a recuperação,
 depois se conecta um modelo com obrigação de citar apenas as evidências retornadas.
+
+A interface `search_app.py` permite formular o argumento de pesquisa, escolher o
+modo de recuperação, filtrar os resultados por seção, consultar a explicação do
+ranking e exportar as evidências em Markdown.
 
 ## Anonimização
 
